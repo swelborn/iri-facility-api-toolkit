@@ -17,6 +17,7 @@ from amsc_iri.api.account_api import AccountApi
 from amsc_iri.api.filesystem_api import FilesystemApi
 from amsc_iri.api.task_api import TaskApi
 from amsc_iri.models.job_spec_input import JobSpecInput as IriJobSpec
+from amsc_iri.models.job_attributes import JobAttributes as IriJobAttributes
 from amsc_iri.models.resource_type import ResourceType
 from amsc_iri.models.job_state import JobState as IriJobState
 from amsc_iri.models.job import Job as IriJob
@@ -351,84 +352,47 @@ class IriServiceClient(ServiceClient):
     def _convert_to_iri_job_spec(self, job_spec: Union["JobSpec", IriJobSpec], name: str = None) -> IriJobSpec:
         """Convert AmSCROT JobSpec to IRI JobSpecInput format.
 
-        Constructs IriJobSpec using direct keyword arguments rather than from_dict()
-        to avoid pydantic setting None for absent fields in model_fields_set, which
-        would cause those fields to be serialized as null and rejected by the API's
-        min_length=1 constraints.
-
-        Callers that already hold a typed ``IriJobSpec`` may pass it straight through.
+        Only present (non-None) values are passed, so absent fields stay out of
+        ``model_fields_set`` and aren't serialized as null (which the API would
+        reject on its min_length=1 constraints). Nested dicts are coerced to the
+        right submodels by pydantic. Callers that already hold a typed
+        ``IriJobSpec`` may pass it straight through.
         """
-        from amsc_iri.models.resource_spec import ResourceSpec as IriResourceSpec
-        from amsc_iri.models.job_attributes import JobAttributes as IriJobAttributes
-        from amsc_iri.models.container import Container as IriContainer
-
         if isinstance(job_spec, IriJobSpec):
             if name and not job_spec.name:
                 job_spec.name = name
             return job_spec
 
-        # --- Executable / arguments ---
-        executable = job_spec.executable or None
-        arguments = job_spec.arguments or None
+        # Fields handled explicitly below; the rest are flat passthroughs.
+        reserved_fields = {"resources", "attributes", "container", "executable", "arguments", "name"}
+        direct_fields = set(IriJobSpec.model_fields) - reserved_fields
 
-        # --- Keyword args for IriJobSpec (only set what we have) ---
-        kwargs: dict = {"executable": executable}
-
-        if arguments:
-            kwargs["arguments"] = arguments
-
-        # Job name
-        job_name = name or (job_spec.name if hasattr(job_spec, "name") and job_spec.name else None)
+        kwargs: dict = {"executable": job_spec.executable or None}
+        if job_spec.arguments:
+            kwargs["arguments"] = job_spec.arguments
+        job_name = name or job_spec.name
         if job_name:
             kwargs["name"] = job_name
-
-        # --- ResourceSpec ---
         if job_spec.resources:
             res_kwargs = {k: v for k, v in job_spec.resources.items() if v is not None}
             if res_kwargs:
-                kwargs["resources"] = IriResourceSpec(**res_kwargs)
-
-        # --- Attributes and top-level IriJobSpec fields ---
-        # Fields that live directly on JobSpecInput (not in JobAttributes)
-        JOBSPEC_DIRECT_FIELDS = {
-            "directory", "stdout_path", "stderr_path", "stdin_path",
-            "inherit_environment", "environment", "pre_launch", "post_launch", "launcher",
-        }
-        # Fields that belong in JobAttributes
-        JOB_ATTRIBUTES_FIELDS = {
-            "duration", "queue_name", "account", "reservation_id", "custom_attributes",
-        }
+                kwargs["resources"] = res_kwargs
 
         if job_spec.attributes:
             attrs = {k: v for k, v in job_spec.attributes.items() if v is not None}
-
-            # Remove resource_id -- handled separately via _get_resource_id
-            attrs.pop("resource_id", None)
-
-            # Lift container dict -> IriContainer object
-            container_data = attrs.pop("container", None)
-            if container_data and isinstance(container_data, dict):
-                kwargs["container"] = IriContainer.from_dict(container_data)
-            elif container_data:
-                kwargs["container"] = container_data
-
-            # Lift all other direct JobSpecInput fields
-            for field in JOBSPEC_DIRECT_FIELDS:
-                val = attrs.pop(field, None)
-                if val is not None:
-                    kwargs[field] = val
-
-            # Whatever remains goes into JobAttributes
-            attrs_kwargs = {k: v for k, v in attrs.items() if k in JOB_ATTRIBUTES_FIELDS}
-            unknown = {k: v for k, v in attrs.items() if k not in JOB_ATTRIBUTES_FIELDS}
-            if unknown:
-                self.logger.debug(
-                    f"[{self.name}] Unmapped job attributes passed to JobAttributes: {list(unknown.keys())}"
-                )
-                attrs_kwargs.update(unknown)
-
-            if attrs_kwargs:
-                kwargs["attributes"] = IriJobAttributes(**attrs_kwargs)
+            attrs.pop("resource_id", None)  # not part of the spec body (TODO: why?)
+            container = attrs.pop("container", None)
+            if container:
+                kwargs["container"] = container
+            for field in direct_fields & set(attrs):
+                kwargs[field] = attrs.pop(field)
+            if attrs:  # whatever remains is JobAttributes
+                unknown = set(attrs) - set(IriJobAttributes.model_fields)
+                if unknown:
+                    self.logger.debug(
+                        f"[{self.name}] Unmapped job attributes passed to JobAttributes: {sorted(unknown)}"
+                    )
+                kwargs["attributes"] = attrs
 
         return IriJobSpec(**kwargs)
     
